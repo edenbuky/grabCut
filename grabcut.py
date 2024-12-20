@@ -11,8 +11,8 @@ GC_PR_FGD = 3 # Soft fg pixel
 
 # Global variable for beta
 beta = None
-epsilon = 1e-10
-
+global_edges = []
+global_weights = []
 # Define the GrabCut algorithm function
 def grabcut(img, rect, n_iter=5):
     # Assign initial labels to the pixels based on the bounding box
@@ -42,63 +42,104 @@ def grabcut(img, rect, n_iter=5):
     mask = finalize_mask(mask)
     return mask, bgGMM, fgGMM
 
+
 def initalize_GMMs(img, mask, n_components=5):
     global beta
     beta = calculate_beta(img)
+    print(f"Initialized beta: {beta}")
+    initialize_neighbor_edges(img)
+
+    # Extract background and foreground pixels based on the mask
     bg_pixels = img[mask == GC_BGD]
     fg_pixels = img[(mask == GC_PR_FGD) | (mask == GC_FGD)]
 
+    print(f"Initializing GMMs: {len(bg_pixels)} background pixels, {len(fg_pixels)} foreground pixels")
+
     def initialize_with_kmeans(pixels, n_clusters):
         if len(pixels) == 0:
+            print("Warning: No pixels for k-means initialization.")
             return np.zeros((n_clusters, pixels.shape[-1])), np.zeros(n_clusters)
+
         from sklearn.cluster import KMeans
         kmeans = KMeans(n_clusters=n_clusters, random_state=42).fit(pixels.reshape(-1, 3))
-        return kmeans.cluster_centers_
+        centers = kmeans.cluster_centers_
+        print(f"k-means centers shape: {centers.shape}")
+        return centers
 
+    # Initialize GMM for background
     bgGMM = GaussianMixture(n_components=n_components, covariance_type='full', random_state=42)
     if len(bg_pixels) > 0:
         centers = initialize_with_kmeans(bg_pixels, n_components)
         bgGMM.means_init = centers
         bgGMM.fit(bg_pixels.reshape(-1, 3))
+        print("Initialized and fitted background GMM.")
+    else:
+        print("Warning: No background pixels for GMM initialization.")
+
+    # Initialize GMM for foreground
     fgGMM = GaussianMixture(n_components=n_components, covariance_type='full', random_state=42)
     if len(fg_pixels) > 0:
         centers = initialize_with_kmeans(fg_pixels, n_components)
         fgGMM.means_init = centers
         fgGMM.fit(fg_pixels.reshape(-1, 3))
-    return bgGMM, fgGMM
+        print("Initialized and fitted foreground GMM.")
+    else:
+        print("Warning: No foreground pixels for GMM initialization.")
 
+    return bgGMM, fgGMM
 def update_GMMs(img, mask, bgGMM, fgGMM):
+    # Extract background and foreground pixels based on the mask
     bg_pixels = img[(mask == GC_BGD) | (mask == GC_PR_BGD)]
     fg_pixels = img[(mask == GC_PR_FGD) | (mask == GC_FGD)]
+
+    print(f"Updating GMMs: {len(bg_pixels)} background pixels, {len(fg_pixels)} foreground pixels")
+
+    # Update GMM for background
     if len(bg_pixels) > 0:
+        # We don't need to re-initialize with k-means here since we're updating
         bgGMM.fit(bg_pixels.reshape((-1, img.shape[-1])))
+        print("Updated background GMM.")
+    else:
+        print("Warning: No background pixels for GMM update.")
+
+    # Update GMM for foreground
     if len(fg_pixels) > 0:
+        # Similarly, no re-initialization needed for update
         fgGMM.fit(fg_pixels.reshape((-1, img.shape[-1])))
+        print("Updated foreground GMM.")
+    else:
+        print("Warning: No foreground pixels for GMM update.")
+
     return bgGMM, fgGMM
 
 def calculate_mincut(img, mask, bgGMM, fgGMM):
     num_pixels = img.shape[0] * img.shape[1]
     source = num_pixels
     sink = num_pixels + 1
-    mask_flat = mask.flatten()
+    print(f"calculate_mincut: Starting with {num_pixels} pixels.")
+
     img_flat = img.reshape(-1, img.shape[-1])
     fg_probs = -fgGMM.score_samples(img_flat).reshape(img.shape[:-1])
     bg_probs = -bgGMM.score_samples(img_flat).reshape(img.shape[:-1])
+
+    print(f"Foreground probabilities: min={fg_probs.min()}, max={fg_probs.max()}")
+    print(f"Background probabilities: min={bg_probs.min()}, max={bg_probs.max()}")
+
     lam = 2 * max(np.abs(fg_probs.max()), np.abs(bg_probs.max()))
+    # Create graph with relevant vertices
     graph = ig.Graph(directed=False)
     graph.add_vertices(num_pixels + 2)
-    edges = []
-    weights = []
 
-    def compute_V(i, j, oi, oj, gamma=50):
-        diff = img[i, j] - img[oi, oj]
-        return gamma * np.exp(- beta * diff.dot(diff))
+    edges = global_edges.copy()
+    weights = global_weights.copy()
 
-    def vid(i, j):
+    def vid(i, j): # vertex ID
         return (img.shape[1] * i) + j
 
     for i in range(img.shape[0]):
         for j in range(img.shape[1]):
+
+            # add edges to source and sink
             if mask[i, j] == GC_FGD or GC_BGD:
                 if mask[i, j] == GC_FGD:
                     edges.append((vid(i, j), source))
@@ -109,66 +150,91 @@ def calculate_mincut(img, mask, bgGMM, fgGMM):
             else:
                 edges.append((vid(i, j), source))
                 weights.append(bg_probs[i, j])
+
                 edges.append((vid(i, j), sink))
                 weights.append(fg_probs[i, j])
-            if i > 0:
-                edges.append((vid(i, j), vid(i-1, j)))
-                weights.append(compute_V(i, j, i-1, j))
-            if j > 0:
-                edges.append((vid(i, j), vid(i, j-1)))
-                weights.append(compute_V(i, j, i, j-1))
-            if i > 0 and j > 0:
-                edges.append((vid(i, j), vid(i-1, j-1)))
-                weights.append(compute_V(i, j, i-1, j-1))
-            if i > 0 and j < img.shape[1] - 1:
-                edges.append((vid(i, j), vid(i-1, j+1)))
-                weights.append(compute_V(i, j, i-1, j+1))
+
     graph.add_edges(edges, attributes={'weight': weights})
+
     min_cut = graph.st_mincut(source, sink, capacity="weight")
     bg_segment = min_cut.partition[0]
     fg_segment = min_cut.partition[1]
+
+    print("calculate_mincut: Computed min-cut. Source size: ", len(bg_segment), ", Sink size: ",len(fg_segment))
+
+    # Return segments and energy
     combined_segments = [bg_segment, fg_segment]
     energy = min_cut.value
+
+    print(f"calculate_mincut: Finished with                               ***Energy*** {energy}.")
     return combined_segments, energy
-
-
 def update_mask(mincut_sets, mask):
     bg_segment, fg_segment = mincut_sets
     num_pixels = mask.shape[0] * mask.shape[1]
     source = num_pixels
     sink = num_pixels + 1
+
+    # Ensure fg_segment is the one with foreground pixels
     if source in bg_segment:
         bg_segment, fg_segment = fg_segment, bg_segment
+
+    # Create a flat version of the mask for easier updates
     mask_flat = mask.flatten()
+
+    # Convert fg_segment and bg_segment to NumPy arrays for vectorized operations
     fg_segment = np.array([v for v in fg_segment if v not in (source, sink)])
     bg_segment = np.array([v for v in bg_segment if v not in (source, sink)])
+
+    # Update probable background pixels in fg_segment to probable foreground
     fg_indices = fg_segment[mask_flat[fg_segment] == GC_PR_BGD]
     mask_flat[fg_indices] = GC_PR_FGD
+
+    # Update probable foreground pixels in bg_segment to probable background
     bg_indices = bg_segment[mask_flat[bg_segment] == GC_PR_FGD]
     mask_flat[bg_indices] = GC_PR_BGD
+
+    # Reshape the mask back to its original dimensions
     new_mask = mask_flat.reshape(mask.shape)
+
+    print(f"update_mask: Updated mask - Probable background: {(new_mask == GC_PR_BGD).sum()}, "
+          f"Probable foreground: {(new_mask == GC_PR_FGD).sum()}")
+    print(f"update_mask: Hard background unchanged: {(new_mask == GC_BGD).sum()}, "
+          f"Hard foreground unchanged: {(new_mask == GC_FGD).sum()}")
+
     return new_mask
+
 
 def check_convergence(energy):
     if not hasattr(check_convergence, "prev_energy"):
         check_convergence.prev_energy = None
     if check_convergence.prev_energy is None:
         check_convergence.prev_energy = energy
+        print(f"First energy value: {energy}")
         return False
-    converged = abs(check_convergence.prev_energy - energy) < 10
+    converged = abs(check_convergence.prev_energy - energy) < 100
+    print(f"Energy difference: {abs(check_convergence.prev_energy - energy)}, Converged: {converged}")
     check_convergence.prev_energy = energy
     return converged
 
 def cal_metric(predicted_mask, gt_mask):
+    # Calculate intersection and union for Jaccard index (IoU)
     intersection = np.logical_and(predicted_mask, gt_mask).sum()
     union = np.logical_or(predicted_mask, gt_mask).sum()
+
+    # Calculate Jaccard index
     jaccard = intersection / union if union != 0 else 1.0
+
+    # Calculate accuracy
     accuracy = (predicted_mask == gt_mask).sum() / predicted_mask.size
+
+    print(f"Metrics - Accuracy: {accuracy * 100:.2f}%, Jaccard: {jaccard * 100:.2f}%")
+
     return accuracy * 100, jaccard * 100
 
 def calculate_beta(img):
     h, w, _ = img.shape
     beta = 0
+
     for i in range(h):
         for j in range(w):
             if i > 0:
@@ -183,18 +249,70 @@ def calculate_beta(img):
             if i > 0 and j < w - 1:
                 diff = img[i, j] - img[i - 1, j + 1]
                 beta += diff.dot(diff)
-    total_connections = 4 * h * w - 3 * (h + w) + 2
+    print(f"Sum of the square of the color differences for all connections of beta : {beta}")
+    # Normalize beta based on the total number of connections (including diagonals)
+    total_connections = 4 * h * w - 3 * (h + w) + 2  # The formula for total connections with diagonals
+    print(f"Total number of connections : {total_connections}")
     beta /= total_connections
+
+    # Adjust beta
     beta *= 2
     beta = 1 / beta
-    return beta
 
+    return beta
+def initialize_neighbor_edges(img):
+    """ Precompute edges and weights for neighboring pixels """
+    global global_edges, global_weights
+    h, w, _ = img.shape
+    edges = []
+    weights = []
+
+    def compute_V(i, j, oi, oj, gamma=50):
+        diff = img[i, j] - img[oi, oj]
+        return gamma * np.exp(- beta * diff.dot(diff))
+
+    def vid(i, j):
+        return (img.shape[1] * i) + j
+
+    for i in range(h):
+        for j in range(w):
+            # Add edges to neighbors
+            if i > 0:
+                oi, oj = i - 1, j
+                edges.append((vid(i, j), vid(oi, oj)))
+                weights.append(compute_V(i, j, oi, oj))
+            if j > 0:
+                oi, oj = i, j - 1
+                edges.append((vid(i, j), vid(oi, oj)))
+                weights.append(compute_V(i, j, oi, oj))
+            if i > 0 and j > 0:
+                oi, oj = i - 1, j - 1
+                edges.append((vid(i, j), vid(oi, oj)))
+                weights.append(compute_V(i, j, oi, oj))
+            if i > 0 and j < w - 1:
+                oi, oj = i - 1, j + 1
+                edges.append((vid(i, j), vid(oi, oj)))
+                weights.append(compute_V(i, j, oi, oj))
+
+    global_edges = edges
+    global_weights = weights
 def finalize_mask(mask):
     mask_flat = mask.flatten()
+
+    # Convert probable background to hard background
     mask_flat[mask_flat == GC_PR_BGD] = GC_BGD
+
+    # Convert probable foreground to hard foreground
     mask_flat[mask_flat == GC_PR_FGD] = GC_FGD
+
+    # Reshape back to original dimensions
     final_mask = mask_flat.reshape(mask.shape)
+
+    print(f"finalize_mask: Finalized mask - hard background: {(final_mask == GC_BGD).sum()}, "
+          f"hard foreground: {(final_mask == GC_FGD).sum()}")
+
     return final_mask
+
 
 def parse():
     parser = argparse.ArgumentParser()
@@ -243,4 +361,3 @@ if __name__ == '__main__':
     cv2.imshow('GrabCut Result', img_cut)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
-

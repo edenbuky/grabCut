@@ -139,21 +139,6 @@ def calculate_mincut(img, mask, bgGMM, fgGMM):
 
     return combined_segments, energy
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def update_mask(mincut_sets, mask):
     bg_segment, fg_segment = mincut_sets
     num_pixels = mask.shape[0] * mask.shape[1]
